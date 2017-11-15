@@ -1,11 +1,15 @@
+/** 
+ * Mongoose model. Accounts
+ * @module models/accountModel
+ * @returns {Object} Mongoose model
+ * @requires factory/addressMessageFactory
+ */
+
 const mongoose = require('mongoose'),
-  messages = require('../factories/messages/accountMessageFactory');
+  messages = require('../factories/messages/addressMessageFactory');
 
 require('mongoose-long')(mongoose);
 
-/** @model accountModel
- *  @description account model - represents an eth account
- */
 const Account = new mongoose.Schema({
   address: {
     type: String,
