@@ -1,4 +1,9 @@
 /**
+ * Copyright 2017–2018, LaborX PTY
+ * Licensed under the AGPL Version 3 license.
+ */
+
+/**
  * Rise a testrpc server
  * @module testrpc-server
  * @requires ethereumjs-testrpc
@@ -11,14 +16,28 @@ const net = require('net'),
   path = require('path'),
   _ = require('lodash'),
   log = bunyan.createLogger({name: 'ipcConverter'}),
-  TestRPC = require('ethereumjs-testrpc');
+  dbPath = path.join(__dirname, 'testrpc_db'),
+  TestRPC = require('ganache-cli');
 
-let RPCServer = TestRPC.server();
-RPCServer.listen(8545);
+const accounts = [
+  '6b9027372deb53f4ae973a5614d8a57024adf33126ece6b587d9e08ba901c0d2',
+  '993130d3dd4de71254a94a47fdacb1c9f90dd33be8ad06b687bd95f073514a97',
+  'c3ea2286b88b51e7cd1cf09ce88b65e9c344302778f96a145c9a01d203f80a4c',
+  '51cd20e24463a0e86c540f074a5f083c334659353eec43bb0bd9297b5929bd35',
+  '7af5f0d70d97f282dfd20a9b611a2e4bd40572c038a89c0ee171a3c93bd6a17a',
+  'cfc6d3fa2b579e3023ff0085b09d7a1cf13f6b6c995199454b739d24f2cf23a5'
+].map(privKey => ({secretKey: Buffer.from(privKey, 'hex'), balance: Math.pow(10, 32).toString(16)}));
+
+if (!fs.existsSync(dbPath))
+  fs.mkdirSync(dbPath);
+
+let RPCServer = TestRPC.server({accounts: accounts, default_balance_ether: 1000, db_path: dbPath, network_id: 86});
+RPCServer.listen(parseInt(process.env.RPC_PORT || 8545));
+const web3ProviderUri = `${/^win/.test(process.platform) ? '\\\\.\\pipe\\' : ''}${config.web3.providers[0]}`;
 
 let addresses = _.chain(RPCServer.provider.manager.state.accounts)
   .toPairs()
-  .map(pair=> {
+  .map(pair => {
     pair[1] = Buffer.from(pair[1].secretKey, 'hex').toString('hex');
     return pair;
   })
@@ -27,21 +46,17 @@ let addresses = _.chain(RPCServer.provider.manager.state.accounts)
 
 console.log(addresses);
 
-
-
 // create RPC server
 const server = net.createServer(stream => {
   stream.on('data', c => {
     try {
-      let payload = JSON.parse(c.toString());
-      RPCServer.provider.sendAsync(payload, (err, data) => {
+      const stringMsg = c.toString();
+      RPCServer.provider.sendAsync(JSON.parse(stringMsg), (err, data) => {
         stream.cork();
         stream.write(JSON.stringify(err || data));
         process.nextTick(() => stream.uncork());
       });
-
     } catch (e) {
-      log.error(e);
       stream.write(JSON.stringify({
         message: e,
         code: -32000
@@ -50,9 +65,9 @@ const server = net.createServer(stream => {
   });
 })
   .on('error', err => {
-  // If pipe file exists try to remove it & start server again
-    if(err.code === 'EADDRINUSE' && removePipeFile(config.web3.uri))
-      server.listen(config.web3.uri);
+    // If pipe file exists try to remove it & start server again
+    if (err.code === 'EADDRINUSE' && removePipeFile(web3ProviderUri))
+      server.listen(web3ProviderUri);
     else
       process.exit(1);
   });
@@ -74,7 +89,7 @@ const removePipeFile = filename => {
 
 // Create directory for Win32
 if (!/^win/.test(process.platform)) {
-  let pathIpc = path.parse(config.web3.uri).dir;
+  let pathIpc = path.parse(web3ProviderUri).dir;
 
   if (!fs.existsSync(pathIpc))
     fs.mkdirSync(pathIpc);
@@ -98,12 +113,13 @@ if (process.platform === 'win32') {
 
 process.on('SIGINT', function () {
   try {
-    removePipeFile(config.web3.uri);
-  } catch (e) {}
+    removePipeFile(web3ProviderUri);
+  } catch (e) {
+  }
   process.exit();
 });
 
 //Going to start server 
-server.listen(config.web3.uri, () => {
+server.listen(web3ProviderUri, () => {
   log.info(`Server: on listening for network - ${config.web3.network}`);
 });

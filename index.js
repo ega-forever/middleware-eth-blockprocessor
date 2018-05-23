@@ -1,29 +1,31 @@
 /**
+ * Copyright 2017–2018, LaborX PTY
+ * Licensed under the AGPL Version 3 license.
+ */
+
+/**
  * Middleware service for handling emitted events on chronobank platform
  * @module Chronobank/eth-blockprocessor
- * @requires config
- * @requires models/blockModel
- * @requires services/blockProcessService
  */
 
 const mongoose = require('mongoose'),
   config = require('./config'),
+  MasterNodeService = require('./services/MasterNodeService'),
   Promise = require('bluebird');
 
 mongoose.Promise = Promise;
 mongoose.connect(config.mongo.data.uri, {useMongoClient: true});
 mongoose.accounts = mongoose.createConnection(config.mongo.accounts.uri, {useMongoClient: true});
 
-const blockModel = require('./models/blockModel'),
-  _ = require('lodash'),
+const _ = require('lodash'),
+  BlockWatchingService = require('./services/blockWatchingService'),
+  SyncCacheService = require('./services/syncCacheService'),
   bunyan = require('bunyan'),
   Web3 = require('web3'),
-  web3Errors = require('web3/lib/web3/errors'),
   net = require('net'),
   amqp = require('amqplib'),
   log = bunyan.createLogger({name: 'app'}),
-  filterTxsByAccountService = require('./services/filterTxsByAccountService'),
-  blockProcessService = require('./services/blockProcessService');
+  filterTxsByAccountService = require('./services/filterTxsByAccountService');
 
 [mongoose.accounts, mongoose.connection].forEach(connection =>
   connection.on('disconnected', function () {
@@ -34,111 +36,112 @@ const blockModel = require('./models/blockModel'),
 
 const init = async () => {
 
-    let currentBlock = await blockModel.findOne({network: config.web3.network}).sort('-block');
-    currentBlock = _.chain(currentBlock).get('block', 0).add(0).value();
-    log.info(`search from block:${currentBlock} for network:${config.web3.network}`);
+  const web3s = config.web3.providers.map((providerURI) => {
+    const provider = /^http/.test(providerURI) ?
+      new Web3.providers.HttpProvider(providerURI) :
+      new Web3.providers.IpcProvider(`${/^win/.test(process.platform) ? '\\\\.\\pipe\\' : ''}${providerURI}`, net);
 
-    let provider = new Web3.providers.IpcProvider(config.web3.uri, net);
     const web3 = new Web3();
     web3.setProvider(provider);
 
-    web3.currentProvider.connection.on('end', () => {
-      log.error('ipc process has finished!');
-      process.exit(0);
-    });
-
-    let amqpInstance = await amqp.connect(config.rabbit.url)
-      .catch(() => {
-        log.error('rabbitmq process has finished!');
-        process.exit(0);
+    if (_.has(web3, 'currentProvider.connection.on')) {
+      web3.currentProvider.connection.on('end', async () => {
+        await Promise.delay(5000);
+        web3.reset();
       });
 
-    let channel = await amqpInstance.createChannel();
+      web3.currentProvider.connection.on('error', async () => {
+        await Promise.delay(5000);
+        web3.reset();
+      });
+    }
 
-    channel.on('close', () => {
+    return web3;
+  });
+
+  let amqpInstance = await amqp.connect(config.rabbit.url)
+    .catch(() => {
       log.error('rabbitmq process has finished!');
       process.exit(0);
     });
 
-    await channel.assertExchange('events', 'topic', {durable: false});
+  let channel = await amqpInstance.createChannel();
 
-    web3.eth.filter('pending').watch(async (err, result) => {
-      if (err)
-        return;
+  channel.on('close', () => {
+    log.error('rabbitmq process has finished!');
+    process.exit(0);
+  });
 
-      let tx = await Promise.promisify(web3.eth.getTransaction)(result);
+  await channel.assertExchange('events', 'topic', {durable: false});
 
-      if (!_.has(tx, 'hash'))
-        return;
 
-      let receipt = Promise.promisify(web3.eth.getTransactionReceipt)(tx.hash);
-      tx.logs = _.get(receipt, 'logs', []);
+  const masterNodeService = new MasterNodeService(channel, (msg) => log.info(msg));
+  await masterNodeService.start();
 
-      let filteredTxs = await filterTxsByAccountService([tx]);
+  const syncCacheService = new SyncCacheService(web3s);
 
-      for (let filteredTx of filteredTxs) {
+  let blockEventCallback = async block => {
+    log.info(`${block.hash} (${block.number}) added to cache.`);
+    await channel.publish('events', `${config.rabbit.serviceName}_block`, new Buffer(JSON.stringify({block: block.number})));
+    const filteredTxs = await filterTxsByAccountService(block.transactions);
 
-        let addresses = _.chain([filteredTx.to, filteredTx.from])
-          .union(filteredTx.logs.map(log => log.address))
-          .uniq()
-          .value();
+    for (let tx of filteredTxs) {
+      let addresses = _.chain([tx.to, tx.from])
+        .union(tx.logs.map(log => log.address))
+        .uniq()
+        .value();
 
-        filteredTx = _.omit(filteredTx, ['blockHash', 'transactionIndex']);
-        filteredTx.blockNumber = -1;
-        for (let address of addresses)
-          await channel.publish('events', `${config.rabbit.serviceName}_transaction.${address}`, new Buffer(JSON.stringify(filteredTx)));
+      for (let address of addresses)
+        await channel.publish('events', `${config.rabbit.serviceName}_transaction.${address}`, new Buffer(JSON.stringify(tx)));
+    }
+  };
+  let txEventCallback = async tx => {
+    const data = await filterTxsByAccountService([tx]);
+    for (let filteredTx of data) {
+      let addresses = _.chain([filteredTx.to, filteredTx.from])
+        .uniq()
+        .value();
+
+      filteredTx = _.omit(filteredTx, ['blockHash', 'transactionIndex']);
+      filteredTx.blockNumber = -1;
+      for (let address of addresses)
+        await channel.publish('events', `${config.rabbit.serviceName}_transaction.${address}`, new Buffer(JSON.stringify(filteredTx)));
+    }
+  };
+
+  syncCacheService.events.on('block', blockEventCallback);
+
+  let endBlock = await syncCacheService.start()
+    .catch((err) => {
+      if (_.get(err, 'code') === 0) {
+        log.info('nodes are down or not synced!');
+        process.exit(0);
       }
-
+      log.error(err);
     });
 
-    /**
-     * Recursive routine for processing incoming blocks.
-     * @return {undefined}
-     */
-    let processBlock = async () => {
-      try {
-        let filteredTxs = await Promise.resolve(blockProcessService(currentBlock, web3)).timeout(20000);
+  await new Promise((res) => {
+    if (config.sync.shadow)
+      return res();
 
-        for (let tx of filteredTxs) {
-          let addresses = _.chain([tx.to, tx.from])
-            .union(tx.logs.map(log => log.address))
-            .uniq()
-            .value();
+    syncCacheService.events.on('end', () => {
+      log.info(`cached the whole blockchain up to block: ${endBlock}`);
+      res();
+    });
+  });
 
-          for (let address of addresses)
-            await channel.publish('events', `${config.rabbit.serviceName}_transaction.${address}`, new Buffer(JSON.stringify(tx)));
-        }
+  let blockWatchingService = new BlockWatchingService(web3s, endBlock);
 
-        await blockModel.findOneAndUpdate({network: config.web3.network}, {
-          $set: {
-            block: currentBlock,
-            created: Date.now()
-          }
-        }, {upsert: true});
+  blockWatchingService.events.on('block', blockEventCallback);
+  blockWatchingService.events.on('tx', txEventCallback);
 
-        currentBlock++;
-        processBlock();
-      } catch (err) {
+  await blockWatchingService.startSync().catch(err => {
+    if (_.get(err, 'code') === 0) {
+      log.error('no connections available or blockchain is not synced!');
+      process.exit(0);
+    }
+  });
 
-        if (err instanceof Promise.TimeoutError)
-          return processBlock();
-
-        if (_.has(err, 'cause') && err.toString() === web3Errors.InvalidConnection('on IPC').toString())
-          return process.exit(-1);
-
-        if (_.get(err, 'code') === 0) {
-          log.info(`await for next block ${currentBlock}`);
-          return setTimeout(processBlock, 10000);
-        }
-
-        currentBlock++;
-        processBlock();
-      }
-    };
-
-    processBlock();
-
-  }
-;
+};
 
 module.exports = init();
