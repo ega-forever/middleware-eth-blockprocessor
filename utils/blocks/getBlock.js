@@ -36,7 +36,7 @@ module.exports = async (blockNumber) => {
   if (rawBlock.miner)
     rawBlock.miner = rawBlock.miner.toLowerCase();
 
-  if(rawBlock.miner === '0x0000000000000000000000000000000000000000')
+  if (rawBlock.miner === '0x0000000000000000000000000000000000000000')
     rawBlock.signers = await getSignersAtHash(web3, rawBlock.hash);
 
   rawBlock.transactions = await Promise.mapSeries(rawBlock.transactions, async transaction => {
@@ -66,25 +66,25 @@ module.exports = async (blockNumber) => {
 
 
   rawBlock.totalTxFee = _.chain(rawBlock.transactions).reduce((result, tx) =>
-    BigNumber(result).plus(BigNumber(tx.gasPrice).multipliedBy(tx.gasUsed)).toString(),
-  '0').value().toString();
+      BigNumber(result).plus(BigNumber(tx.gasPrice).multipliedBy(tx.gasUsed)).toString(),
+    '0').value().toString();
 
 
-  rawBlock.rewards = await Promise.mapSeries(rawBlock.signers && rawBlock.signers.length ? rawBlock.signers : [rawBlock.miner], async miner=>{
+  rawBlock.rewards = await Promise.mapSeries(rawBlock.signers && rawBlock.signers.length ? rawBlock.signers : [rawBlock.miner], async miner => {
 
-    let balanceBefore = await web3.eth.getBalance(miner, rawBlock.number - 1);
+    let balanceBefore = rawBlock.number === 0 ? 0 : await web3.eth.getBalance(miner, rawBlock.number - 1);
     let balanceCurrent = await web3.eth.getBalance(miner, rawBlock.number);
 
-    let delta = _.reduce(rawBlock.transactions, (result, tx)=>{
+    let delta = _.reduce(rawBlock.transactions, (result, tx) => {
 
-      if(tx.from && tx.to && tx.from === tx.to && tx.from === miner){
+      if (tx.from && tx.to && tx.from === tx.to && tx.from === miner) {
         return BigNumber(result).minus(BigNumber(BigNumber(tx.gasPrice).multipliedBy(tx.gasUsed))).toString();
       }
 
-      if(tx.from && tx.from === miner)
+      if (tx.from && tx.from === miner)
         return BigNumber(result).minus(BigNumber(BigNumber(tx.gasPrice).multipliedBy(tx.gasUsed))).toString();
 
-      if(tx.to && tx.to === miner)
+      if (tx.to && tx.to === miner)
         return BigNumber(result).plus(tx.value).toString();
 
       return result;
@@ -97,12 +97,6 @@ module.exports = async (blockNumber) => {
     }
 
   });
-
-
-
-
-
-
 
 
   if (!rawBlock.transactions.length)
